@@ -28,7 +28,7 @@ func main() {
 	fmt.Printf("Number of Shards: %d\n", len(bc.Shards))
 	fmt.Printf("Current Difficulty: %d\n", bc.CurrentDifficulty)
 	fmt.Printf("Genesis Timestamp: %s\n", time.Now().Format(time.RFC3339))
-	fmt.Println("===============================\n")
+	fmt.Println("===============================")
 
 	// Create two example transactions
 	tx1 := blockchain.NewTransaction(
@@ -84,7 +84,7 @@ func main() {
 	for i, p := range update.Proof {
 		fmt.Printf("  Proof %d: %x\n", i, p)
 	}
-	fmt.Println("============================\n")
+	fmt.Println("============================")
 
 	// Mine a new block on shard 0
 	bc.AddBlock([]*blockchain.Transaction{tx1, tx2}, 0)
