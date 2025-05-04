@@ -63,33 +63,45 @@ func TestIntegration_AllModules(t *testing.T) {
 	}
 
 	// 4) Cross-shard sync: commitment & apply
+		// 4) Cross-Shard Sync: full end-to-end with ZKProof
 	t.Log("=== Module: Cross-Shard Sync ===")
 	css := NewCrossShardSync()
+	// Register shard 0 (you can register more if you like)
 	css.RegisterShard(0)
-	css.RegisterShard(1)
 
-	stateRoot := []byte("dummyStateRoot")
-	commit := css.CreateStateCommitment(0, stateRoot, []byte{0}, []byte{0xFF})
-	t.Logf("Created StateCommitment Signature: %x", commit.Signature)
-	if !css.VerifyStateCommitment(commit) {
-		t.Fatal("VerifyStateCommitment failed")
+	// Pick some dummy leaves to sync
+	stateLeaves := [][]byte{[]byte("leafA"), []byte("leafB")}
+	// Generate a real StateUpdate (includes Merkle proofs + ZK proof + VClock)
+	update := css.GenerateStateUpdate(
+	  0,                // shardID
+	  []byte{0x00},     // range start
+	  []byte{0xFF},     // range end
+	  stateLeaves,      // the actual leaves
+	)
+
+	t.Logf("Generated StateUpdate: SubRoot=%x, ZKProof.Commitment=%x",
+	  update.SubRoot, update.ZKProof.Commitment)
+
+	// 4a) Commitment must verify
+	if !css.VerifyStateCommitment(update.Commitment) {
+	  t.Fatal("VerifyStateCommitment failed")
 	}
 	t.Log("VerifyStateCommitment succeeded")
 
-	update := &StateUpdate{
-		ShardID:    0,
-		RangeStart: []byte{0},
-		RangeEnd:   []byte{0xFF},
-		Proof:      [][]byte{},          // empty proof is OK
-		SubRoots:   [][]byte{stateRoot}, // not used by ApplyStateUpdate
-		Timestamp:  time.Now().Unix(),
-		Commitment: commit,
+	// 4b) ApplyStateUpdate must verify Merkle proofs & ZK proof & causal clock
+	if !css.ApplyStateUpdate(update) {
+	  t.Fatal("ApplyStateUpdate returned false")
 	}
-	applied := css.ApplyStateUpdate(update)
-	t.Logf("ApplyStateUpdate returned: %v", applied)
-	if !applied {
-		t.Fatal("ApplyStateUpdate returned false")
+	t.Log("ApplyStateUpdate succeeded")
+
+	// 4c) Explicitly check the ZK proof against the same states
+	oldSt := &State{RootHash: nil}
+	newSt := &State{RootHash: update.SubRoot}
+	if !css.zkpParams.VerifyProof(update.ZKProof, oldSt, newSt) {
+	  t.Fatal("ZKProof VerifyProof failed")
 	}
+	t.Log("ZKProof VerifyProof succeeded\n")
+
 
 	// 5) BFT manager scoring & leader selection
 	t.Log("=== Module: BFT Manager ===")

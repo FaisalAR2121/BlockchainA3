@@ -4,29 +4,35 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"sync"
 	"time"
 )
 
-// CrossShardSync manages cross-shard state synchronization
+// CrossShardSync manages cross-shard state synchronization.
 type CrossShardSync struct {
 	mu            sync.RWMutex
 	stateChannels map[uint32]chan *StateUpdate
 	commitments   map[string]*StateCommitment
+	zkpParams     *ZKPParams
+	vectorClocks  map[uint32]*VectorClock
 }
 
-// StateUpdate represents a partial state update for a specific key-range
+// StateUpdate represents a partial state update for a specific key‐range.
 type StateUpdate struct {
 	ShardID    uint32
 	RangeStart []byte
 	RangeEnd   []byte
-	Proof      [][]byte         // serialized Merkle proofs for each included leaf
-	SubRoots   [][]byte         // subtree roots corresponding to each leaf set
+	Leaves     [][]byte     // state entries (leaf hashes) in [RangeStart,RangeEnd]
+	Proof      [][]byte     // serialized Merkle proof blobs, one per leaf
+	ZKProof    *ZKProof     // structured zero-knowledge proof
+	SubRoot    []byte       // Merkle root over the Leaves
+	VClock     *VectorClock // causal timestamp snapshot
 	Timestamp  int64
-	Commitment *StateCommitment // cryptographic commitment
+	Commitment *StateCommitment // cryptographic commitment to this subrange
 }
 
-// StateCommitment represents a cryptographic commitment to a state range
+// StateCommitment is a cryptographic commitment to a state range.
 type StateCommitment struct {
 	RootHash   []byte
 	RangeStart []byte
@@ -35,22 +41,25 @@ type StateCommitment struct {
 	Signature  []byte
 }
 
-// NewCrossShardSync creates a new cross-shard synchronization manager
+// NewCrossShardSync initializes a new cross‐shard sync manager.
 func NewCrossShardSync() *CrossShardSync {
 	return &CrossShardSync{
 		stateChannels: make(map[uint32]chan *StateUpdate),
 		commitments:   make(map[string]*StateCommitment),
+		zkpParams:     NewZKPParams(),
+		vectorClocks:  make(map[uint32]*VectorClock),
 	}
 }
 
-// RegisterShard registers a shard for synchronization
+// RegisterShard registers a shard ID to receive updates, initializing its clock.
 func (css *CrossShardSync) RegisterShard(shardID uint32) {
 	css.mu.Lock()
 	defer css.mu.Unlock()
 	css.stateChannels[shardID] = make(chan *StateUpdate, 100)
+	css.vectorClocks[shardID] = NewVectorClock()
 }
 
-// BroadcastStateUpdate sends a state update to all other shards
+// BroadcastStateUpdate sends an update to all other registered shards.
 func (css *CrossShardSync) BroadcastStateUpdate(update *StateUpdate) {
 	css.mu.RLock()
 	defer css.mu.RUnlock()
@@ -59,13 +68,13 @@ func (css *CrossShardSync) BroadcastStateUpdate(update *StateUpdate) {
 			select {
 			case ch <- update:
 			default:
-				// skip if full
+				// skip if channel buffer is full
 			}
 		}
 	}
 }
 
-// CreateStateCommitment creates a cryptographic commitment to a state range
+// CreateStateCommitment commits to a subrange [start,end] and its Merkle root.
 func (css *CrossShardSync) CreateStateCommitment(shardID uint32, root, start, end []byte) *StateCommitment {
 	c := &StateCommitment{
 		RootHash:   root,
@@ -73,23 +82,22 @@ func (css *CrossShardSync) CreateStateCommitment(shardID uint32, root, start, en
 		RangeEnd:   end,
 		Timestamp:  time.Now().Unix(),
 	}
-	// compute signature = H(Timestamp || RangeStart || RangeEnd || RootHash)
 	h := sha256.New()
 	binary.Write(h, binary.BigEndian, c.Timestamp)
 	h.Write(c.RangeStart)
 	h.Write(c.RangeEnd)
 	h.Write(c.RootHash)
 	c.Signature = h.Sum(nil)
-	// store commitment
+
 	css.mu.Lock()
 	css.commitments[string(c.Signature)] = c
 	css.mu.Unlock()
+
 	return c
 }
 
-// VerifyStateCommitment verifies a state commitment's integrity and existence
+// VerifyStateCommitment checks integrity and existence of a commitment.
 func (css *CrossShardSync) VerifyStateCommitment(c *StateCommitment) bool {
-	// recompute signature
 	h := sha256.New()
 	binary.Write(h, binary.BigEndian, c.Timestamp)
 	h.Write(c.RangeStart)
@@ -99,53 +107,95 @@ func (css *CrossShardSync) VerifyStateCommitment(c *StateCommitment) bool {
 	if !bytes.Equal(expected, c.Signature) {
 		return false
 	}
-	// ensure stored
 	css.mu.RLock()
 	defer css.mu.RUnlock()
 	_, ok := css.commitments[string(c.Signature)]
 	return ok
 }
 
-// GenerateStateUpdate produces a StateUpdate for a given shard and key-range
-type GenerateStateUpdate func(shardID uint32, start, end []byte, leaves [][]byte) *StateUpdate
+// GenerateStateUpdate constructs a partial‐state update with Merkle proofs, ZK proof, and VClock.
+func (css *CrossShardSync) GenerateStateUpdate(
+	shardID uint32,
+	start, end []byte,
+	leaves [][]byte,
+) *StateUpdate {
+	// 1) Merkle sub-root
+	subRoot := BuildMerkleTree(leaves)
 
-func (css *CrossShardSync) GenerateStateUpdate(shardID uint32, start, end []byte, leaves [][]byte) *StateUpdate {
+	// 2) Per-leaf Merkle proofs
 	proofs := make([][]byte, len(leaves))
 	for i := range leaves {
-		p := BuildMerkleProof(leaves, i)
-		proofs[i] = concatProof(p)
+		proofHashes := BuildMerkleProof(leaves, i)
+		proofs[i] = concatProof(proofHashes)
 	}
-	root := BuildMerkleTree(leaves)
-	commit := css.CreateStateCommitment(shardID, root, start, end)
+
+	// 3) Commitment for this range
+	commit := css.CreateStateCommitment(shardID, subRoot, start, end)
+
+	// 4) ZK proof over the new state root
+	oldState := &State{RootHash: nil}
+	newState := &State{RootHash: subRoot}
+	zkproof := css.zkpParams.GenerateProof(oldState, newState)
+
+	// 5) Advance & snapshot the shard’s vector clock
+	vc := css.vectorClocks[shardID]
+	vc.Increment(fmt.Sprint(shardID))
+	snapshot := NewVectorClock()
+	snapshot.Update(vc)
+
 	return &StateUpdate{
 		ShardID:    shardID,
 		RangeStart: start,
 		RangeEnd:   end,
+		Leaves:     leaves,
 		Proof:      proofs,
-		SubRoots:   [][]byte{root},
+		ZKProof:    zkproof,
+		SubRoot:    subRoot,
+		VClock:     snapshot,
 		Timestamp:  time.Now().Unix(),
 		Commitment: commit,
 	}
 }
 
-// ApplyStateUpdate verifies and applies a received StateUpdate
+// ApplyStateUpdate verifies Merkle proofs, ZK proof, and causal ordering.
 func (css *CrossShardSync) ApplyStateUpdate(update *StateUpdate) bool {
+	// A) Commitment integrity
 	if !css.VerifyStateCommitment(update.Commitment) {
 		return false
 	}
-	// verify each proof matches commitment root
-	for _, p := range update.Proof {
-		proofHashes := decodeProof(p)
-		root := VerifyMerkleProof(nil, proofHashes)
+	// B) Merkle proof checks
+	for i, blob := range update.Proof {
+		proofHashes := decodeProof(blob)
+		leaf := update.Leaves[i]
+		root := VerifyMerkleProof(leaf, proofHashes)
 		if !bytes.Equal(root, update.Commitment.RootHash) {
 			return false
 		}
 	}
-	// integrate update into local state store here
+	// C) Zero-knowledge proof
+	oldState := &State{RootHash: nil}
+	newState := &State{RootHash: update.SubRoot}
+	if !css.zkpParams.VerifyProof(update.ZKProof, oldState, newState) {
+		return false
+	}
+	// D) Causal consistency: reject stale updates
+	local := css.vectorClocks[update.ShardID]
+	if local.Compare(update.VClock) == 1 {
+		// local clock > update clock => stale
+		return false
+	}
+	// Merge clocks for future updates
+	local.Update(update.VClock)
+
+	// TODO: apply update.Leaves to the local StateDB
 	return true
 }
 
-// concatProof serializes a slice of byte slices into one flat []byte
+// func (css *CrossShardSync) ApplyStateUpdate(update *StateUpdate) bool {
+//     return true
+// }
+
+// concatProof flattens multiple 32-byte hashes into one byte slice.
 func concatProof(proof [][]byte) []byte {
 	var out []byte
 	for _, p := range proof {
@@ -154,7 +204,7 @@ func concatProof(proof [][]byte) []byte {
 	return out
 }
 
-// decodeProof splits a flat proof blob into fixed-size 32-byte hashes
+// decodeProof splits a flat byte slice back into 32-byte hashes.
 func decodeProof(data []byte) [][]byte {
 	var proofs [][]byte
 	for i := 0; i+32 <= len(data); i += 32 {

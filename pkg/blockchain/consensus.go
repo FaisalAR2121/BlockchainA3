@@ -1,12 +1,25 @@
 package blockchain
 
 import (
-	"math/big"
-	"sync"
-	"time"
+  "bytes"
+//   "crypto/sha256"
+  "math/big"
+  "math/rand"
+  "sync"
+  "time"
 )
 
-// ConsensusManager manages the hybrid consensus protocol
+// maxTarget is the maximum possible 256-bit value (2^256−1).
+var maxTarget *big.Int
+
+func init() {
+	maxTarget = new(big.Int).Sub(
+		new(big.Int).Lsh(big.NewInt(1), 256),
+		big.NewInt(1),
+	)
+}
+
+// ConsensusManager manages the hybrid PoW + dBFT consensus.
 type ConsensusManager struct {
 	mu            sync.RWMutex
 	bftManager    *BFTManager
@@ -20,14 +33,15 @@ type ConsensusManager struct {
 	lastBlockTime time.Time
 }
 
-// NewConsensusManager creates a new consensus manager
+// NewConsensusManager creates a new consensus manager.
+// Starts with difficulty 2^16 and target = maxTarget / difficulty.
 func NewConsensusManager(bftManager *BFTManager) *ConsensusManager {
-	target := big.NewInt(1)
-	target.Lsh(target, 256-16) // Adjust difficulty as needed
+	difficulty := new(big.Int).Lsh(big.NewInt(1), 16) // 2^16
+	target := new(big.Int).Div(maxTarget, difficulty)
 
 	return &ConsensusManager{
 		bftManager:    bftManager,
-		difficulty:    big.NewInt(16), // Adjust as needed
+		difficulty:    difficulty,
 		target:        target,
 		roundDuration: 10 * time.Second,
 		currentRound:  0,
@@ -37,7 +51,20 @@ func NewConsensusManager(bftManager *BFTManager) *ConsensusManager {
 	}
 }
 
-// StartRound starts a new consensus round
+// MineBlock runs proof-of-work: finds a nonce s.t. H(block||nonce) < target.
+// It sets block.Nonce and block.Hash when found.
+func (cm *ConsensusManager) MineBlock(b *Block) {
+	for {
+		b.Nonce = rand.Uint64()
+		h := b.CalculateHash()
+		if new(big.Int).SetBytes(h).Cmp(cm.target) == -1 {
+			b.Hash = h
+			return
+		}
+	}
+}
+
+// StartRound begins a new dBFT voting round among the given nodes.
 func (cm *ConsensusManager) StartRound(nodes []string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -45,105 +72,111 @@ func (cm *ConsensusManager) StartRound(nodes []string) {
 	cm.currentRound++
 	cm.votes = make(map[string]int)
 	cm.proposals = make(map[string]*Block)
-
-	// Select leader using VRF
 	cm.leader = cm.bftManager.SelectLeader(nodes, cm.currentRound)
+	cm.lastBlockTime = time.Now()
 }
 
-// ProposeBlock proposes a new block
+// ProposeBlock is called by the leader to register its mined block.
 func (cm *ConsensusManager) ProposeBlock(block *Block, nodeID string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Only leader can propose in the first phase
 	if nodeID != cm.leader {
 		return false
 	}
-
-	// Verify PoW
+	// Verify that the block’s PoW meets the target
 	if !cm.verifyPoW(block) {
 		return false
 	}
-
 	cm.proposals[nodeID] = block
 	return true
 }
 
-// Vote votes on a proposed block
+// Vote allows any trusted node to vote on a proposed block.
 func (cm *ConsensusManager) Vote(blockHash []byte, nodeID string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Check if node is trusted
 	if !cm.bftManager.IsNodeTrusted(nodeID) {
 		return false
 	}
-
-	// Increment vote count
 	cm.votes[string(blockHash)]++
-
-	// Check if consensus reached
 	return cm.checkConsensus(blockHash)
 }
 
-// verifyPoW verifies the proof of work
-func (cm *ConsensusManager) verifyPoW(block *Block) bool {
-	// Calculate block hash
-	hash := block.CalculateHash()
-
-	// Convert hash to big integer
+// verifyPoW checks that block.Hash (or CalculateHash) < target.
+func (cm *ConsensusManager) verifyPoW(b *Block) bool {
+	hash := b.CalculateHash()
 	hashInt := new(big.Int).SetBytes(hash)
-
-	// Check if hash meets target difficulty
 	return hashInt.Cmp(cm.target) == -1
 }
 
-// checkConsensus checks if consensus is reached
+// checkConsensus returns true once votes for blockHash reach the BFT threshold.
 func (cm *ConsensusManager) checkConsensus(blockHash []byte) bool {
 	totalVotes := 0
-	for _, count := range cm.votes {
-		totalVotes += count
+	for _, v := range cm.votes {
+		totalVotes += v
 	}
-
-	// Get current consensus threshold
-	threshold := cm.bftManager.GetConsensusThreshold()
-
-	// Check if votes exceed threshold
-	voteRatio := float64(cm.votes[string(blockHash)]) / float64(totalVotes)
-	return voteRatio >= threshold
+	if totalVotes == 0 {
+		return false
+	}
+	needed := cm.bftManager.GetConsensusThreshold()
+	ratio := float64(cm.votes[string(blockHash)]) / float64(totalVotes)
+	return ratio >= needed
 }
 
-// GetLeader returns the current round leader
+// FinalizeBlock returns true if the block has been proposed and voted through.
+func (cm *ConsensusManager) FinalizeBlock(block *Block) bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	// Ensure leader proposed it
+	proposed, ok := cm.proposals[cm.leader]
+	if !ok || !bytes.Equal(proposed.Hash, block.Hash) {
+		return false
+	}
+	return cm.checkConsensus(block.Hash)
+}
+
+// AdjustDifficulty tunes difficulty based on time since last block.
+func (cm *ConsensusManager) AdjustDifficulty() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	elapsed := time.Since(cm.lastBlockTime)
+	targetTime := 10 * time.Second
+
+	// coarsely adjust difficulty by ±1
+	switch {
+	case elapsed > targetTime*2:
+		cm.difficulty.Sub(cm.difficulty, big.NewInt(1))
+	case elapsed < targetTime/2:
+		cm.difficulty.Add(cm.difficulty, big.NewInt(1))
+	}
+	if cm.difficulty.Cmp(big.NewInt(1)) < 0 {
+		cm.difficulty.SetInt64(1)
+	}
+	// recompute target = maxTarget / difficulty
+	cm.target = new(big.Int).Div(maxTarget, cm.difficulty)
+}
+
+// GetLeader returns the current round’s leader.
 func (cm *ConsensusManager) GetLeader() string {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.leader
 }
 
-// GetRound returns the current round number
+// GetRound returns the current round number.
 func (cm *ConsensusManager) GetRound() int {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 	return cm.currentRound
 }
 
-// AdjustDifficulty adjusts the PoW difficulty
-func (cm *ConsensusManager) AdjustDifficulty() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	// Calculate time since last block
-	timeSinceLast := time.Since(cm.lastBlockTime)
-	targetTime := 10 * time.Second // Adjust as needed
-
-	// Adjust difficulty based on block time
-	if timeSinceLast > targetTime*2 {
-		cm.difficulty.Sub(cm.difficulty, big.NewInt(1))
-	} else if timeSinceLast < targetTime/2 {
-		cm.difficulty.Add(cm.difficulty, big.NewInt(1))
-	}
-
-	// Update target
-	cm.target = new(big.Int).Exp(big.NewInt(2), big.NewInt(256), nil)
-	cm.target.Div(cm.target, cm.difficulty)
+// Difficulty returns the current difficulty.
+func (cm *ConsensusManager) Difficulty() *big.Int {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return new(big.Int).Set(cm.difficulty)
 }

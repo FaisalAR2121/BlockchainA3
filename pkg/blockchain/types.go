@@ -14,7 +14,7 @@ type Block struct {
 	Transactions []*Transaction
 	PrevHash     []byte
 	Hash         []byte
-	Nonce        int
+	Nonce        uint64
 	MerkleRoot   []byte
 	StateRoot    []byte
 	ShardID      uint32
