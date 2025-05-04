@@ -1,4 +1,4 @@
-module github.com/Faiq/blockchain
+module github.com/FaisalAR2121/BlockchainA3
 
 go 1.21
 

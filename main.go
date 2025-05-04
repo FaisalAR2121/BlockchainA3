@@ -3,8 +3,7 @@ package main
 import (
 	"fmt"
 	"time"
-
-	"github.com/Faiq/blockchain/pkg/blockchain"
+	"github.com/FaisalAR2121/BlockchainA3/pkg/blockchain"
 )
 
 func main() {
